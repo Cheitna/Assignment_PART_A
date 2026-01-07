@@ -253,7 +253,7 @@ st.markdown("""
 4. 🟢 Green → grammar correction  
 5. Click words to see suggestions
 """)
-user_input = st.text_area("Enter text:", height=150)
+user_input = st.text_area("**Enter text (max 500 words):**", height=150)
 
 if st.button("🔍 Check Text", use_container_width=True):
     corrected_tokens, grammar_indices, _, errors = detect_errors(user_input, nlp)
