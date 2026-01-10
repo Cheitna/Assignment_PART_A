@@ -44,9 +44,9 @@ AUX_VERBS = BE_VERBS | HAS_VERBS | DO_VERBS
 FUNCTION_WORDS = {
     "no","this","that","which","who","whom","whose",
     "it","they","we","he","she","a","an","the",
-    "and","or","but","of","in","on","for","to",
+    "and","or","but","of","in","on","for",
     "with","by","at","not","any","already","very","i","me","my","mine","you","yours","your","he"
-    ,"him","his","she","her","hers","we","us","ours","they","their","theirs","more","once","these","those","there"
+    ,"him","his","she","her","hers","we","us","ours","they","theirs","more","once","these","those"
 }
 
 IRREGULAR_PAST = {
@@ -57,7 +57,7 @@ PAST_PARTICIPLES = set(IRREGULAR_PAST.values())
 QUANTIFIERS = {"many", "few", "several", "all", "some", "most", "each"}
 
 # -----------------------------
-# Load corpus (Updated for Everygram/Trigram)
+# Load corpus 
 # -----------------------------
 @st.cache_resource
 def load_models():
@@ -82,32 +82,81 @@ VOCAB_SIZE = len(VOCAB)
 # -----------------------------
 # Helper functions (Updated for Everygram/Trigram)
 # -----------------------------
-def get_contextual_prob(word, prev_word, prev_2_word):
-    # 1. Try Trigram Score
+def ngram_probability(word, prev_word=None, prev_2_word=None):
+    # Trigram
     if prev_2_word and prev_word:
-        tri_count = TRIGRAM_COUNTS.get((prev_2_word, prev_word, word), 0)
-        if tri_count > 0:
-            bi_context = BIGRAM_COUNTS.get((prev_2_word, prev_word), 0)
-            return (tri_count / (bi_context + VOCAB_SIZE)) * 10.0
-    
-    # 2. Try Bigram Score
+        tri = TRIGRAM_COUNTS.get((prev_2_word, prev_word, word), 0)
+        bi = BIGRAM_COUNTS.get((prev_2_word, prev_word), 0)
+        if bi > 0:
+            return (tri + 1) / (bi + VOCAB_SIZE)
+
+    # Bigram
     if prev_word:
-        bi_count = BIGRAM_COUNTS.get((prev_word, word), 0)
-        if bi_count > 0:
-            uni_context = UNIGRAM_COUNTS.get(prev_word, 0)
-            return (bi_count / (uni_context + VOCAB_SIZE)) * 5.0
-            
-    # 3. Fallback to Unigram Probability
-    return UNIGRAM_COUNTS.get(word, 0) / TOTAL_UNIGRAMS
+        bi = BIGRAM_COUNTS.get((prev_word, word), 0)
+        uni = UNIGRAM_COUNTS.get(prev_word, 0)
+        if uni > 0:
+            return (bi + 1) / (uni + VOCAB_SIZE)
 
-def generate_candidates(word):
-    return [v for v in VOCAB if edit_distance(word.lower(), v) <= 2]
+    # Unigram
+    return (UNIGRAM_COUNTS.get(word, 0) + 1) / (TOTAL_UNIGRAMS + VOCAB_SIZE)
 
+# -----------------------------
+# Candidate generation
+# -----------------------------
+MODALS = {
+    "will", "would", "can", "could", "may", "might",
+    "shall", "should", "must"
+}
+
+# -----------------------------
+# Confusion sets
+# -----------------------------
+CONFUSION_SETS = {
+    "to": ["to", "too", "two"],
+    "too": ["to", "too", "two"],
+    "two": ["to", "too", "two"],
+    "their": ["their", "there", "they're"],
+    "there": ["their", "there", "they're"],
+    "they're": ["their", "there", "they're"]
+}
+
+# -----------------------------
+# Generate candidates (edit-distance + confusion set)
+# -----------------------------
+def generate_candidates(word, real_word=False):
+    low = word.lower()
+
+    # -----------------------------
+    # Real-word candidates
+    # -----------------------------
+    if real_word:
+        candidates = []
+
+        if low in CONFUSION_SETS:
+            candidates.extend(CONFUSION_SETS[low])
+
+        candidates.extend(
+            v for v in VOCAB if edit_distance(low, v) <= 1
+        )
+
+        return list(set(c for c in candidates if c != low))
+
+    # -----------------------------
+    # Non-word candidates (FIXED)
+    # -----------------------------
+    else:
+        return [
+            v for v in VOCAB
+            if edit_distance(low, v) <= 2
+            and v != low          # ✅ CRITICAL
+        ]
+
+####-------------------------
 def rank_candidates(candidates, prev_word, prev_2_word, original):
     ranked = []
     for c in candidates:
         # Everygram score (Trigram -> Bigram -> Unigram)
-        score = get_contextual_prob(c, prev_word, prev_2_word)
+        score = ngram_probability(c, prev_word, prev_2_word)
         
         # Add edit distance weighting
         dist = edit_distance(original.lower(), c)
@@ -117,129 +166,233 @@ def rank_candidates(candidates, prev_word, prev_2_word, original):
     return sorted(ranked, key=lambda x: x["score"], reverse=True)[:5]
 
 # -----------------------------
-# Grammar correction (Original Logic Intact)
+# Grammar correction
 # -----------------------------
 def apply_grammar(doc):
     corrected_tokens = [t.text for t in doc]
-    grammar_indices = []
-    
-    # --- STEP 1: QUANTIFIER LOGIC ---
-    plural_fix_made = False
+    grammar_indices = set()
+
+    # --- STEP 1: Pluralize nouns after quantifiers ---
+    quantifiers = {"many", "few", "several", "all", "some", "most", "various"}
+    pluralized_subjects = set()  # Track which nouns were pluralized
+
     for i, token in enumerate(doc):
-        if token.text.lower() in {"many", "several", "few", "all", "some", "most", "various"}:
-            for j in range(i + 1, min(len(doc), i + 4)):
-                if doc[j].is_punct or doc[j].pos_ == "ADP": break
-                if doc[j].pos_ == "NOUN" or doc[j].tag_ == "NN":
-                    if doc[j].tag_ != "NNS":
-                        plural_word = doc[j]._.inflect("NNS")
-                        if plural_word:
-                            corrected_tokens[j] = plural_word
-                            grammar_indices.append(j)
-                            plural_fix_made = True
-                            break
+        if token.text.lower() in quantifiers:
+            for j in range(i+1, min(i+4, len(doc))):
+                if doc[j].is_punct or doc[j].pos_ == "ADP":
+                    break
+                if doc[j].pos_ == "NOUN" and doc[j].tag_ != "NNS":
+                    plural_form = doc[j]._.inflect("NNS")
+                    if plural_form:
+                        if corrected_tokens[j] != plural_form:
+                            corrected_tokens[j] = plural_form
+                            grammar_indices.add(j)
+                        pluralized_subjects.add(j)
+                        break
 
-    # --- FIX: RE-PROCESS AFTER STEP 1 ---
-    # We move this OUTSIDE the loop so it only runs once if any change was made
-    if plural_fix_made:
-        new_text = " ".join(corrected_tokens)
-        doc = nlp(new_text)
+    # --- STEP 2: Subject-verb agreement ---
+    for i, token in enumerate(doc):
+        if token.pos_ not in {"VERB", "AUX"}:
+            continue
+        if token.tag_ == "MD" or any(a.tag_ == "MD" for a in token.ancestors):
+            continue
 
-    # --- STEP 2: HYBRID SUBJECT-VERB AGREEMENT ---
-    for token in doc:
-        # A: Auxiliary Guard
-        if token.pos_ == "VERB" and any(w.lemma_ == "do" for w in token.ancestors):
-            if token.tag_ == "VBZ": 
-                base = token._.inflect("VB")
-                if base:
-                    corrected_tokens[token.i] = base
-                    grammar_indices.append(token.i)
-            continue 
-
-        # B: Find the Subject
+        # Find subject: prefer left children, else previous token
         subj = None
         nsubj = [w for w in token.lefts if w.dep_ == "nsubj"]
         if nsubj:
             subj = nsubj[0]
-        elif token.i > 0:
-            prev_t = doc[token.i - 1]
-            if prev_t.pos_ in {"PRON", "NOUN", "PROPN"}:
-                subj = prev_t
+        elif i > 0 and doc[i-1].pos_ in {"PRON", "NOUN", "PROPN"}:
+            subj = doc[i-1]
 
-        if subj and (token.pos_ in {"VERB", "AUX"}):
-            subj_word = corrected_tokens[subj.i].lower()
-            token_text_low = token.text.lower()
-            
-            # AI Check: Ensure AI is treated as 3rd Person Singular
-            is_sing_3rd = (subj_word in {"he", "she", "it", "ai"} or subj.tag_ in {"NN", "NNP"})
-            if subj.text.isupper() and 2 <= len(subj.text) <= 7:
-                is_sing_3rd = True
+        if not subj:
+            continue
 
-            is_plural_type = (subj_word in {"i", "you", "we", "they"} or 
-                              subj.tag_ in {"NNS", "NNPS"} or 
-                              subj_word in {"children", "people", "men", "women"})
+        subj_idx = subj.i
+        subj_word = corrected_tokens[subj_idx].lower()
+        subj_tag = subj.tag_
 
-            if is_sing_3rd:
-                # Fix "AI have" -> "AI has" / "AI do" -> "AI does"
-                if token.lemma_ == "do" and token_text_low == "do":
-                    corrected_tokens[token.i] = "does"
-                    grammar_indices.append(token.i)
-                elif token.lemma_ == "be" and token_text_low == "were":
-                    corrected_tokens[token.i] = "was"
-                    grammar_indices.append(token.i)
-                elif token.lemma_ == "have" and token_text_low == "have": # Explicit Have fix
-                    corrected_tokens[token.i] = "has"
-                    grammar_indices.append(token.i)
-                elif token.tag_ == "VBP":
-                    sing_v = token._.inflect("VBZ")
-                    if sing_v:
-                        corrected_tokens[token.i] = sing_v
-                        grammar_indices.append(token.i)
+        is_singular = subj_tag in {"NN", "NNP"} or subj_word in {"he", "she", "it"}
+        is_plural = subj_tag in {"NNS", "NNPS"} or subj_word in {"i", "you", "we", "they"} \
+                    or subj_word in {"children", "people", "men", "women"} or subj_tag == "NNS"
 
-            elif is_plural_type:
-                if subj_word == "i" and token_text_low == "was":
-                    continue
-                if token.lemma_ == "do" and token_text_low == "does":
-                    corrected_tokens[token.i] = "do"
-                    grammar_indices.append(token.i)
-                elif token.tag_ == "VBZ":
-                    plural_v = token._.inflect("VBP") or token._.inflect("VB")
-                    if plural_v:
-                        corrected_tokens[token.i] = plural_v
-                        grammar_indices.append(token.i)
+        if subj_idx in pluralized_subjects:
+            is_singular = False
+            is_plural = True
 
-            # --- STEP 3: FINAL CLEANUP ---
-            if corrected_tokens:
-                if corrected_tokens[0][0].islower():
-                    corrected_tokens[0] = corrected_tokens[0].capitalize()
-                    if 0 not in grammar_indices: grammar_indices.append(0)
-                for i in range(len(corrected_tokens)):
-                    if corrected_tokens[i].lower() == "i" and len(corrected_tokens[i]) == 1:
-                        corrected_tokens[i] = "I"
-                        if i not in grammar_indices: grammar_indices.append(i)
-                    if i > 0 and corrected_tokens[i-1] in {".", "!", "?"}:
-                        if corrected_tokens[i][0].islower():
-                            corrected_tokens[i] = corrected_tokens[i].capitalize()
-                            if i not in grammar_indices: grammar_indices.append(i)
+        # --- BE verbs ---
+        if token.lemma_ == "be":
+            new_val = "is"
+            if subj_word == "i":
+                new_val = "am"
+            elif is_plural:
+                new_val = "are"
+            if corrected_tokens[i] != new_val:
+                corrected_tokens[i] = new_val
+                grammar_indices.add(i)
 
-    return corrected_tokens, list(set(grammar_indices))
+        # --- HAVE verbs ---
+        elif token.lemma_ == "have":
+            new_val = "has"
+            if subj_word == "i" or is_plural:
+                new_val = "have"
+            if corrected_tokens[i] != new_val:
+                corrected_tokens[i] = new_val
+                grammar_indices.add(i)
 
-def detect_errors(text, nlp):
+        # --- DO verbs ---
+        elif token.lemma_ == "do":
+            new_val = "does"
+            if subj_word == "i" or is_plural:
+                new_val = "do"
+            if corrected_tokens[i] != new_val:
+                corrected_tokens[i] = new_val
+                grammar_indices.add(i)
+
+        # --- Main verbs (present tense) ---
+        elif token.pos_ == "VERB" and token.tag_ in {"VB", "VBP", "VBZ"}:
+            if token.tag_ in {"VBN", "VBG"}:
+                continue
+            base = token.lemma_
+            inflected = token.text
+            if is_singular:
+                inflected = token._.inflect("VBZ") or token.text
+            elif is_plural:
+                inflected = token._.inflect("VBP") or token.text
+            if corrected_tokens[i] != inflected:
+                corrected_tokens[i] = inflected
+                grammar_indices.add(i)
+
+    # --- STEP 3: Capitalization ---
+    for i, word in enumerate(corrected_tokens):
+        new_word = word
+        if i == 0:
+            new_word = word.capitalize()
+        if word.lower() == "i" and len(word) == 1:
+            new_word = "I"
+        if i > 0 and corrected_tokens[i-1] in {".", "!", "?"}:
+            new_word = word.capitalize()
+        if corrected_tokens[i] != new_word:
+            corrected_tokens[i] = new_word
+            grammar_indices.add(i)
+
+    return corrected_tokens, list(grammar_indices)
+# -----------------------------
+# Detect errors with confusion matrix
+# -----------------------------
+def detect_errors(text, nlp, threshold_ratio=1.5):
+    """
+    Hybrid spelling & real-word error detection using trigram probabilities.
+    - Non-word: TextBlob spellcheck
+    - Real-word: candidate edit-distance + trigram scoring
+    - Confusion sets are always considered and can bypass threshold_ratio
+    """
     doc = nlp(text)
     corrected_tokens, grammar_indices = apply_grammar(doc)
-    spelling_errors = []
-    
-    for i, token in enumerate(doc):
-        word_to_check = corrected_tokens[i]
-        if not word_to_check.isalpha() or i in grammar_indices: continue
-        low = word_to_check.lower()
-        if low == "i" or low in FUNCTION_WORDS or low in AUX_VERBS: continue
-        lemma = token.lemma_.lower()
-        if low not in VOCAB and lemma not in VOCAB:
-            try: suggestion = Word(low).spellcheck()[0][0]
-            except: suggestion = low
-            spelling_errors.append({"word": word_to_check, "index": i, "suggestion": suggestion})
+    errors = []
+    confusion_matrix = {}
 
-    return corrected_tokens, grammar_indices, {}, spelling_errors
+    for i, token in enumerate(corrected_tokens):
+        low = token.lower()
+
+        # Skip punctuation or grammar-fixed tokens
+        if not token.isalpha() or i in grammar_indices:
+            continue
+
+        # Skip 'I'
+        if low == "i":
+            continue
+
+        prev = corrected_tokens[i-1].lower() if i > 0 else None
+        prev2 = corrected_tokens[i-2].lower() if i > 1 else None
+
+        # -----------------------------
+        # Non-word errors
+        if low not in VOCAB:
+            try:
+                suggestion = Word(low).spellcheck()[0][0]
+            except:
+                suggestion = low
+            errors.append({
+                "word": token,
+                "index": i,
+                "suggestion": suggestion,
+                "type": "non-word"
+            })
+            confusion_matrix[low] = suggestion
+            continue
+
+        # -----------------------------
+        # Real-word errors
+        candidates = []
+        # Skip pronouns that should never be flagged
+        if low in {"i", "he", "she", "we", "they", "it", "you"}:
+            continue
+
+        # 1. Confusion set first (always considered)
+        in_confusion_set = False
+        if low in CONFUSION_SETS:
+            candidates.extend([c for c in CONFUSION_SETS[low] if c != low])
+            in_confusion_set = True
+
+        # 2️. Edit-distance 1 from vocab
+        candidates.extend([v for v in VOCAB if edit_distance(low, v) == 1 and v != low])
+
+        if not candidates:
+            continue
+
+        # Step 2: compute trigram/bigram probability for each candidate
+        candidate_probs = []
+        for c in candidates:
+            prob = 0
+            if prev2 and prev:
+                tri = TRIGRAM_COUNTS.get((prev2, prev, c), 0)
+                bi = BIGRAM_COUNTS.get((prev2, prev), 0)
+                prob = (tri + 1) / (bi + VOCAB_SIZE + 1) if bi > 0 else 0
+            elif prev:
+                bi_count = BIGRAM_COUNTS.get((prev, c), 0)
+                uni_count = UNIGRAM_COUNTS.get(prev, 0)
+                prob = (bi_count + 1) / (uni_count + VOCAB_SIZE + 1) if uni_count > 0 else 0
+            else:
+                prob = (UNIGRAM_COUNTS.get(c, 0) + 1) / (TOTAL_UNIGRAMS + VOCAB_SIZE + 1)
+            candidate_probs.append({"word": c, "prob": prob})
+
+        # Step 3: compute current word probability
+        if prev2 and prev:
+            tri = TRIGRAM_COUNTS.get((prev2, prev, low), 0)
+            bi = BIGRAM_COUNTS.get((prev2, prev), 0)
+            current_prob = (tri + 1) / (bi + VOCAB_SIZE + 1) if bi > 0 else 0
+        elif prev:
+            bi_count = BIGRAM_COUNTS.get((prev, low), 0)
+            uni_count = UNIGRAM_COUNTS.get(prev, 0)
+            current_prob = (bi_count + 1) / (uni_count + VOCAB_SIZE + 1) if uni_count > 0 else 0
+        else:
+            current_prob = (UNIGRAM_COUNTS.get(low, 0) + 1) / (TOTAL_UNIGRAMS + VOCAB_SIZE + 1)
+
+        # Step 4: pick best candidate
+        best_candidate = max(candidate_probs, key=lambda x: x["prob"])
+
+        # Step 5: determine if should flag
+        flag_error = False
+        if in_confusion_set:
+            # Always flag if confusion set suggests a different word
+            if best_candidate["word"] != low:
+                flag_error = True
+        else:
+            # Otherwise, only flag if candidate significantly more likely
+            if best_candidate["word"] != low and best_candidate["prob"] > current_prob * threshold_ratio:
+                flag_error = True
+
+        if flag_error:
+            errors.append({
+                "word": token,
+                "index": i,
+                "suggestion": best_candidate["word"],
+                "type": "real-word"
+            })
+            confusion_matrix[low] = best_candidate["word"]
+
+    return corrected_tokens, grammar_indices, confusion_matrix, errors
 
 # -----------------------------
 # Streamlit UI
@@ -249,39 +402,79 @@ st.markdown("""
 **How to use:**  
 1. Enter your text  
 2. Click **Check Text**  
-3. 🔴 Red → spelling error  
+3. 🔴 Red → spelling or real-word error  
 4. 🟢 Green → grammar correction  
 5. Click words to see suggestions
 """)
+# Initialize variables
+corrected_tokens = []
+grammar_indices = []
+errors = []
+
 user_input = st.text_area("**Enter text (max 500 words):**", height=150)
 
 if st.button("🔍 Check Text", use_container_width=True):
     corrected_tokens, grammar_indices, _, errors = detect_errors(user_input, nlp)
     spelling_idx = {e["index"] for e in errors}
 
+    # Highlighted text
     highlighted = []
     for i, tok in enumerate(corrected_tokens):
-        if tok in {".", ",", "!", "?", ";", ":"}: highlighted.append(tok)
-        elif i in spelling_idx: highlighted.append(f"<span style='color:red;font-weight:bold'>{tok}</span>")
-        elif i in grammar_indices: highlighted.append(f"<span style='color:green;font-weight:bold'>{tok}</span>")
-        else: highlighted.append(tok)
+        if tok in {".", ",", "!", "?", ";", ":"}:
+            highlighted.append(tok)
+        elif i in spelling_idx:
+            highlighted.append(f"<span style='color:red;font-weight:bold'>{tok}</span>")
+        elif i in grammar_indices:
+            highlighted.append(f"<span style='color:green;font-weight:bold'>{tok}</span>")
+        else:
+            highlighted.append(tok)
 
     html_text = ""
     for w in highlighted:
-        if w in {".", ",", "!", "?", ";", ":"}: html_text = html_text.rstrip() + w + " "
-        else: html_text += w + " "
+        if w in {".", ",", "!", "?", ";", ":"}:
+            html_text = html_text.rstrip() + w + " "
+        else:
+            html_text += w + " "
+
     st.subheader("🖍 Highlighted Text")
     st.markdown(html_text.strip(), unsafe_allow_html=True)
 
-    if errors:
+    # ---------------- Suggestions panel ----------------
+    if errors:  # This now works
         st.subheader("📌 Suggestions")
-        for e in errors:
-            with st.expander(f"`{e['word']}`"):
-                idx = e["index"]
-                prev = corrected_tokens[idx-1].lower() if idx > 0 else None
-                prev_2 = corrected_tokens[idx-2].lower() if idx > 1 else None
-                for s in rank_candidates(generate_candidates(e["word"].lower()), prev, prev_2, e["word"].lower()):
-                    st.markdown(f"- **{s['word']}** | score `{round(s['score'],4)}`")
+for e in errors:
+    idx = e["index"]
+    prev = corrected_tokens[idx-1].lower() if idx > 0 else None
+    prev_2 = corrected_tokens[idx-2].lower() if idx > 1 else None
+    with st.expander(f"`{e['word']}` → `{e['suggestion']}` ({e['type']})"):
+        is_real_word = e["type"] == "real-word"
+        candidates = generate_candidates(e['word'], real_word=is_real_word)
+        ranked = []
+
+        if is_real_word:
+            # For real-word, use trigram score as before
+            for c in candidates:
+                score = 0
+                if prev_2 and prev:
+                    score = TRIGRAM_COUNTS.get((prev_2, prev, c), 0)
+                elif prev:
+                    score = BIGRAM_COUNTS.get((prev, c), 0)
+                if score == 0:
+                    score = UNIGRAM_COUNTS.get(c, 0)
+                ranked.append({"word": c, "score": score})
+            ranked = sorted(ranked, key=lambda x: x["score"], reverse=True)[:5]
+            for s in ranked:
+                st.markdown(f"- **{s['word']}** | score `{round(s['score'], 4)}`")
+        else:
+            # For non-word, use edit distance
+            for c in candidates:
+                dist = edit_distance(e['word'].lower(), c)
+                ranked.append({"word": c, "edit_distance": dist})
+            ranked = sorted(ranked, key=lambda x: x["edit_distance"])[:5]
+            for s in ranked:
+                st.markdown(f"- **{s['word']}** | edit distance `{s['edit_distance']}`")
+
+
 # -----------------------------
 # Compact Dictionary Explorer
 # -----------------------------
@@ -337,3 +530,4 @@ with st.expander("View Full Dictionary List", expanded=False):
     )
 
 st.caption("📘 MSc Artificial Intelligence | NLP System")
+
